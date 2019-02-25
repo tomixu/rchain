@@ -3,6 +3,17 @@ package coop.rchain.metrics
 import cats._
 import cats.data._
 import cats.implicits._
+import coop.rchain.metrics.Metrics.Source
+
+trait Span {
+  def mark(name: String): Unit
+  def close(): Unit
+}
+
+final case class NoopSpan() extends Span {
+  def mark(name: String): Unit = ()
+  def close(): Unit            = ()
+}
 
 trait Metrics[F[_]] {
   // Counter
@@ -23,6 +34,8 @@ trait Metrics[F[_]] {
   def record(name: String, value: Long, count: Long = 1)(implicit ev: Metrics.Source): F[Unit]
 
   def timer[A](name: String, block: F[A])(implicit ev: Metrics.Source): F[A]
+
+  def span[A](source: Source): F[Span]
 }
 
 object Metrics extends MetricsInstances {
@@ -40,6 +53,7 @@ object Metrics extends MetricsInstances {
     def record(name: String, value: Long, count: Long = 1)(implicit ev: Metrics.Source): F[Unit] =
       ().pure[F]
     def timer[A](name: String, block: F[A])(implicit ev: Metrics.Source): F[A] = block
+    def span[A](source: Source): F[Span]                                       = ().pure[F].map(_ => NoopSpan())
   }
 
   import shapeless.tag.@@
@@ -90,5 +104,6 @@ sealed abstract class MetricsInstances {
           implicit ev: Metrics.Source
       ): EitherT[F, E, A] =
         EitherT(evF.timer(name, block.value))
+      def span[A](source: Source): EitherT[F, E, Span] = EitherT.liftF(evF.span(source))
     }
 }
