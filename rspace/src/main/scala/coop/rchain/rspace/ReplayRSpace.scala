@@ -1,6 +1,5 @@
 package coop.rchain.rspace
 
-import scala.annotation.tailrec
 import scala.collection.JavaConverters._
 import scala.collection.immutable.Seq
 import scala.concurrent.ExecutionContext
@@ -141,26 +140,37 @@ class ReplayRSpace[F[_], C, P, E, A, R, K](store: IStore[F, C, P, A, K], branch:
               }
       } yield r
 
-//    @tailrec <- todo fix tailrec
     @SuppressWarnings(Array("org.wartremover.warts.Throw"))
     // TODO stop throwing exceptions
-    def getCommOrDataCandidates(comms: Seq[COMM]): F[Either[COMM, Seq[DataCandidate[C, R]]]] =
-      comms match {
-        case Nil =>
-          val msg = "List comms must not be empty"
-          logger.error(msg)
-          throw new IllegalArgumentException(msg)
-        case commRef :: Nil =>
-          runMatcher(commRef).map {
-            case Some(x) => Right(x)
-            case None    => Left(commRef)
-          }
-        case commRef :: rem =>
-          runMatcher(commRef).flatMap {
-            case Some(x) => Right(x).asInstanceOf[Either[COMM, Seq[DataCandidate[C, R]]]].pure[F]
-            case None    => getCommOrDataCandidates(rem)
-          }
+    def getCommOrDataCandidates(comms: Seq[COMM]): F[Either[COMM, Seq[DataCandidate[C, R]]]] = {
+      type COMMOrData  = Either[COMM, Seq[DataCandidate[C, R]]]
+      type Accumulator = (Seq[COMM], Option[COMMOrData])
+      implicit class RichAccumulator(acc: Accumulator) {
+        def comms: Seq[COMM]           = acc._1
+        def result: Option[COMMOrData] = acc._2
       }
+      object Accumulator {
+        def apply(comms: Seq[COMM], cp: Option[COMMOrData] = None): Accumulator = (comms, cp)
+      }
+      def go(acc: Accumulator) =
+        acc.comms match {
+          case Nil =>
+            val msg = "List comms must not be empty"
+            logger.error(msg)
+            throw new IllegalArgumentException(msg)
+          case commRef :: Nil =>
+            runMatcher(commRef).map {
+              case Some(x) => Accumulator(Nil, Some(x.asRight[COMM]))
+              case None    => Accumulator(Nil, Some(Left(commRef)))
+            }
+          case commRef :: rem =>
+            runMatcher(commRef).map {
+              case Some(x) => Accumulator(rem, Some(x.asRight[COMM]))
+              case None    => Accumulator(rem, None)
+            }
+        }
+      concurrent.iterateWhileM(Accumulator(comms))(go)(_.result.isEmpty).map(_.result.get)
+    }
 
     for {
       _          <- logger.debug(s"""|consume: searching for data matching <patterns: $patterns>
@@ -198,43 +208,97 @@ class ReplayRSpace[F[_], C, P, E, A, R, K](store: IStore[F, C, P, A, K], branch:
   private[this] def lockedProduce(channel: C, data: A, persist: Boolean, sequenceNumber: Int)(
       implicit m: Match[P, E, A, R]
   ): F[Either[E, Option[(ContResult[C, P, K], Seq[Result[R]])]]] = {
-    //@tailrec <- todo fix tailrec
     def runMatcher(
         comm: COMM,
         produceRef: Produce,
         groupedChannels: Seq[Seq[C]]
-    ): F[Option[ProduceCandidate[C, P, R, K]]] =
-      groupedChannels match {
-        case Nil => None.asInstanceOf[Option[ProduceCandidate[C, P, R, K]]].pure[F]
-        case channels :: remaining =>
-          for {
-            matchCandidates <- store.withTxnF(store.createTxnReadF()) { txn =>
-                                store.getWaitingContinuation(txn, channels).zipWithIndex.filter {
-                                  case (WaitingContinuation(_, _, _, source), _) =>
-                                    comm.consume == source
+    ): F[Option[ProduceCandidate[C, P, R, K]]] = {
+
+      type Result = ProduceCandidate[C, P, R, K]
+
+      type Accumulator = (List[Seq[C]], Option[Result])
+      implicit class RichAccumulator(acc: Accumulator) {
+        def channels = acc._1
+        def result   = acc._2
+      }
+      object Accumulator {
+        def apply(channels: List[Seq[C]], maybeResult: Option[Result] = None) =
+          (channels, maybeResult)
+      }
+      def go(acc: Accumulator) =
+        acc.channels match {
+          case Nil => Accumulator(Nil).pure[F]
+          case channels :: remaining =>
+            for {
+              matchCandidates <- store.withTxnF(store.createTxnReadF()) { txn =>
+                                  store.getWaitingContinuation(txn, channels).zipWithIndex.filter {
+                                    case (WaitingContinuation(_, _, _, source), _) =>
+                                      comm.consume == source
+                                  }
                                 }
-                              }
-            channelToIndexedDataList <- store.withTxnF(store.createTxnReadF()) { txn =>
-                                         channels.map { c: C =>
-                                           val as = store.getData(txn, Seq(c)).zipWithIndex.filter {
-                                             case (Datum(_, _, source), _) =>
-                                               comm.produces.contains(source)
-                                           }
-                                           c -> {
-                                             if (c == channel)
-                                               Seq((Datum(data, persist, produceRef), -1))
-                                             else as
+              channelToIndexedDataList <- store.withTxnF(store.createTxnReadF()) { txn =>
+                                           channels.map { c: C =>
+                                             val as =
+                                               store.getData(txn, Seq(c)).zipWithIndex.filter {
+                                                 case (Datum(_, _, source), _) =>
+                                                   comm.produces.contains(source)
+                                               }
+                                             c -> {
+                                               if (c == channel)
+                                                 Seq((Datum(data, persist, produceRef), -1))
+                                               else as
+                                             }
                                            }
                                          }
-                                       }
-            result <- extractFirstMatch(channels, matchCandidates, channelToIndexedDataList.toMap) match {
-                       case Right(None)             => runMatcher(comm, produceRef, remaining)
-                       case Right(produceCandidate) => produceCandidate.pure[F]
-                       case Left(_)                 => ???
-                     }
-          } yield result
+              result = extractFirstMatch(channels, matchCandidates, channelToIndexedDataList.toMap) match {
+                case Right(None)             => Accumulator(remaining, None)
+                case Right(produceCandidate) => Accumulator(remaining, produceCandidate)
+                case Left(_)                 => ???
+              }
+            } yield result
+        }
+      concurrent
+        .iterateWhileM(Accumulator(groupedChannels.toList))(go)(
+          acc => acc.channels.nonEmpty && acc.result.isEmpty
+        )
+        .map(_.result)
+    }
 
+    @SuppressWarnings(Array("org.wartremover.warts.Throw"))
+    // TODO stop throwing exceptions
+    def getCommOrProduceCandidate(
+        comms: Seq[COMM],
+        produceRef: Produce,
+        groupedChannels: Seq[Seq[C]]
+    ): F[Either[COMM, ProduceCandidate[C, P, R, K]]] = {
+      type COMMOrProduce = Either[COMM, ProduceCandidate[C, P, R, K]]
+      type Accumulator   = (Seq[COMM], Option[COMMOrProduce])
+      implicit class RichAccumulator(acc: Accumulator) {
+        def comms: Seq[COMM]              = acc._1
+        def result: Option[COMMOrProduce] = acc._2
       }
+      object Accumulator {
+        def apply(comms: Seq[COMM], cp: Option[COMMOrProduce] = None): Accumulator = (comms, cp)
+      }
+      def go(acc: Accumulator): F[Accumulator] =
+        acc.comms match {
+          case Nil =>
+            val msg = "comms must not be empty"
+            logger.error(msg)
+            throw new IllegalArgumentException(msg)
+          case commRef :: Nil =>
+            runMatcher(commRef, produceRef, groupedChannels) map {
+              case Some(x) => Accumulator(Nil, Some(Right(x)))
+              case None    => Accumulator(Nil, Some(Left(commRef)))
+            }
+          case commRef :: rem =>
+            runMatcher(commRef, produceRef, groupedChannels) map {
+              case Some(x) => Accumulator(rem, Some(Right(x)))
+              case None    => Accumulator(rem, None)
+            }
+        }
+      concurrent.iterateWhileM(Accumulator(comms))(go)(_.result.isEmpty).map(_.result.get)
+    }
 
     def storeDatum(
         produceRef: Produce,
@@ -312,30 +376,12 @@ class ReplayRSpace[F[_], C, P, E, A, R, K](store: IStore[F, C, P, A, K], branch:
                  case None =>
                    storeDatum(produceRef, None).map(r => Right(r))
                  case Some(comms) =>
-                   //@tailrec <-- todo fix tailrec
-                   @SuppressWarnings(Array("org.wartremover.warts.Throw"))
-                   // TODO stop throwing exceptions
-                   def getCommOrProduceCandidate(
-                       comms: Seq[COMM]
-                   ): F[Either[COMM, ProduceCandidate[C, P, R, K]]] =
-                     comms match {
-                       case Nil =>
-                         val msg = "comms must not be empty"
-                         logger.error(msg)
-                         throw new IllegalArgumentException(msg)
-                       case commRef :: Nil =>
-                         runMatcher(commRef, produceRef, groupedChannels) map {
-                           case Some(x) => Right(x)
-                           case None    => Left(commRef)
-                         }
-                       case commRef :: rem =>
-                         runMatcher(commRef, produceRef, groupedChannels) flatMap {
-                           case Some(x) => x.asRight[COMM].pure[F]
-                           case None    => getCommOrProduceCandidate(rem)
-                         }
-                     }
                    val commOrProduceCandidate: F[Either[COMM, ProduceCandidate[C, P, R, K]]] =
-                     getCommOrProduceCandidate(comms.iterator().asScala.toList)
+                     getCommOrProduceCandidate(
+                       comms.iterator().asScala.toList,
+                       produceRef,
+                       groupedChannels
+                     )
                    val r: F[Either[E, Option[(ContResult[C, P, K], Seq[Result[R]])]]] = commOrProduceCandidate flatMap {
                      case Left(comm) =>
                        storeDatum(produceRef, Some(comm)).map(r => Right(r))
