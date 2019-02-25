@@ -13,7 +13,7 @@ import coop.rchain.rspace.internal._
 import coop.rchain.rspace.trace.{Produce, Log => RSpaceLog, _}
 import com.google.common.collect.Multiset
 import com.typesafe.scalalogging.Logger
-import coop.rchain.metrics.Metrics
+import coop.rchain.metrics.{Metrics, Span}
 import scodec.Codec
 
 class ReplayRSpace[F[_], C, P, E, A, R, K](store: IStore[F, C, P, A, K], branch: Branch)(
@@ -37,6 +37,8 @@ class ReplayRSpace[F[_], C, P, E, A, R, K](store: IStore[F, C, P, A, K], branch:
 
   private[this] val consumeCommLabel = MetricsSource + ".comm.consume"
   private[this] val produceCommLabel = MetricsSource + ".comm.produce"
+  private[this] val consumeSpanLabel = Metrics.Source(MetricsSource, ".consume")
+  private[this] val produceSpanLabel = Metrics.Source(MetricsSource, ".produce")
 
   @SuppressWarnings(Array("org.wartremover.warts.NonUnitStatements")) // TODO remove when Kamon replaced with Metrics API
   def consume(
@@ -53,9 +55,14 @@ class ReplayRSpace[F[_], C, P, E, A, R, K](store: IStore[F, C, P, A, K], branch:
         val msg = "channels.length must equal patterns.length"
         logF.error(msg) *> syncF.raiseError(new IllegalArgumentException(msg))
       } else
-        consumeLockF(channels) {
-          lockedConsume(channels, patterns, continuation, persist, sequenceNumber)
-        }
+        for {
+          span <- metricsF.span(consumeSpanLabel)
+          _    = span.mark("before-consume-lock")
+          result <- consumeLockF(channels) {
+                     lockedConsume(channels, patterns, continuation, persist, sequenceNumber, span)
+                   }
+          _ = span.mark("post-consume-lock")
+        } yield result
     }
 
   type MaybeConsumeResult = Either[E, Option[(ContResult[C, P, K], Seq[Result[R]])]]
@@ -66,7 +73,8 @@ class ReplayRSpace[F[_], C, P, E, A, R, K](store: IStore[F, C, P, A, K], branch:
       patterns: Seq[P],
       continuation: K,
       persist: Boolean,
-      sequenceNumber: Int
+      sequenceNumber: Int,
+      span: Span
   )(
       implicit m: Match[P, E, A, R]
   ): F[MaybeConsumeResult] = {
@@ -178,6 +186,7 @@ class ReplayRSpace[F[_], C, P, E, A, R, K](store: IStore[F, C, P, A, K], branch:
       _          <- logger.debug(s"""|consume: searching for data matching <patterns: $patterns>
                      |at <channels: $channels>""".stripMargin.replace('\n', ' ')).pure[F]
       consumeRef = Consume.create(channels, patterns, continuation, persist, sequenceNumber)
+      _          = span.mark("after-compute-consumeref")
       r <- replayData.get(consumeRef) match {
             case None =>
               storeWaitingContinuation(consumeRef, None).map(_.asRight[E])
@@ -201,13 +210,25 @@ class ReplayRSpace[F[_], C, P, E, A, R, K](store: IStore[F, C, P, A, K], branch:
       implicit m: Match[P, E, A, R]
   ): F[Either[E, Option[(ContResult[C, P, K], Seq[Result[R]])]]] =
     contextShift.evalOn(scheduler) {
-      produceLockF(channel) {
-        lockedProduce(channel, data, persist, sequenceNumber)
-      }
+      for {
+        span <- metricsF.span(produceSpanLabel)
+        _    = span.mark("before-produce-lock")
+        result <- produceLockF(channel) {
+                   lockedProduce(channel, data, persist, sequenceNumber, span)
+                 }
+        _ = span.mark("post-produce-lock")
+        _ = span.close()
+      } yield result
     }
 
   @SuppressWarnings(Array("org.wartremover.warts.NonUnitStatements")) // TODO remove when Kamon replaced with Metrics API
-  private[this] def lockedProduce(channel: C, data: A, persist: Boolean, sequenceNumber: Int)(
+  private[this] def lockedProduce(
+      channel: C,
+      data: A,
+      persist: Boolean,
+      sequenceNumber: Int,
+      span: Span
+  )(
       implicit m: Match[P, E, A, R]
   ): F[Either[E, Option[(ContResult[C, P, K], Seq[Result[R]])]]] = {
     def runMatcher(
@@ -368,11 +389,14 @@ class ReplayRSpace[F[_], C, P, E, A, R, K](store: IStore[F, C, P, A, K], branch:
       groupedChannels <- store.withTxnF(store.createTxnReadF()) { txn =>
                           store.getJoin(txn, channel)
                         }
+      _ = span.mark("after-fetch-joins")
 
       _ = logger.debug(s"""|produce: searching for matching continuations
                        |at <groupedChannels: $groupedChannels>""".stripMargin.replace('\n', ' '))
 
       produceRef = Produce.create(channel, data, persist, sequenceNumber)
+
+      _ = span.mark("after-compute-produceref")
 
       result <- replayData.get(produceRef) match {
                  case None =>
